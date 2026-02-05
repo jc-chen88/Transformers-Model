@@ -1,0 +1,466 @@
+---
+title: "STAT 3675Q Honors Project"
+author: "Jingang Chen"
+date: "2025-12-07"
+output:
+  pdf_document:
+    latex_engine: xelatex
+fontsize: 12pt
+urlcolor: blue
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE)
+options(crayon.enabled = FALSE)
+```
+## Overview
+The transformers architecture is a type of neural network that learns the context 
+of sequential data and to generate or predict new data via the encoder decoder 
+sequence. Traditionally used for natural language processing (NLP), the transformers model has a unique learning mechanism known as self-attention, which enables the model to consider the relationship between different elements of an input sequence. It operates using 3 components:
+
+    - **Queries (Q)**: represents what the model is trying to focus on in 
+    the input sequence
+    
+    - *Keys (K)**: act as the identifiers for the elements in the sequence, 
+    which helps them determine their relevance to the queries
+    
+    - **Values ()**: the actual information that will be used to predict the 
+    output based on attention scores calculated from the queries and keys
+    
+Transformers models can also be used on time-series analysis, where its data 
+consists of ordered samples/observations that are recorded sequentially 
+over time. The project will use the electricity transformer data set (ETTH), where its values are recorded on a hourly basis. The target variable that will be used 
+for prediction will be the oil temperature. 3 different methods will be used: 
+torch and keras, and they will follow through similar components 
+outlined below:
+
+    1. **Preprocessing the data** - loading the data set and affirming the 
+    correct data types
+    
+    2. **Sequence generation** - generating sequences that will be used for 
+    testing and training
+    
+    3. **Positional encoding** - gives each position/time step a unique 
+    signal so the model can distinguish between the positions. This is done by 
+    creating a unique vector for each position the sequence with sine and 
+    cosine functions.
+    
+    4. **Transformers model** - create a Transformer encoder model that sets up 
+    model layers and parameters and processes positional encoding provided 
+    before
+    
+    5. **Traing and testing** - model will be trained using epochs and will be 
+    evaluated using MSE loss.
+
+Note that while a traditional transformers uses an encoder decoding sequence, 
+time series forecasting in this case only requires an encoder in its 
+implementation because there is no needed to generate a new sequence step by step.
+An encoder is sufficient to capture the temporal dependencies and patterns 
+in a given input sequence.
+
+## Loading dataset
+```{r}
+df <- read.csv("ETTh1.csv")
+head(df)
+str(df)
+
+data <- as.matrix(df[, -1]) # select only numerical features, takes out time
+```
+There are seven numerical variables, with the target goal variable being OT.
+
+
+## Using Torch
+
+### Preprocess
+
+```{r}
+library(torch)
+# normalize data
+data <- scale(data) 
+data_tensor <- torch_tensor(data) # convert to tensor
+
+# split data 80% training 20% testing
+
+train_index <- floor(data_tensor$size(1)* 0.8)
+
+train_torch <- data_tensor[1:train_index, ]
+test_torch <- data_tensor[(train_index+1):data_tensor$size(1), ]
+
+```
+The data is converted into a tensor data type, which was then split into 
+training and testing data sets.
+
+## Create sequences
+```{r}
+sequence_creation <- function(data_tensor, seq_len, pred_len) {
+  # x is the previous data, y is the "target" data
+  x_list <- list()
+  y_list <- list()
+  
+  for (i in 1:(data_tensor$size(1) - seq_len - pred_len + 1)) {
+    x_list[[i]] <- data_tensor[i:(i + seq_len - 1), ]
+    y_list[[i]] <- data_tensor[(i + seq_len):
+                                 (i + seq_len + pred_len - 1), 7]$unsqueeze(2)
+  }
+  
+  x <- torch_stack(x_list)
+  y <- torch_stack(y_list)
+  
+  return(list(x=x, y=y))
+  
+}
+
+
+# use the past 96 hours (4 days) to predict the next 24 hours of data
+seq_len <- 96
+pred_len <- 24
+train_seq <- sequence_creation(train_torch, seq_len, pred_len)
+X_train <- train_seq$x
+y_train <- train_seq$y
+
+test_seq <- sequence_creation(test_torch, seq_len, pred_len)
+X_test <- test_seq$x
+y_test <- test_seq$y
+```
+
+Sequence creation was implemented using a sliding window method, where a fixed 
+length window of consecutive past observations is moved step by step to generate 
+input sequences. For each input sequence, the corresponding output sequence is the set of future values immediately following the input window.This will create 
+overlapping segments across the data to ensure that all patterns across the 
+time intervals are captured.
+
+
+### Create Positional encoding
+```{r}
+# adds positional information to token embeddings, allowing model to retain 
+# information about the positions in the input sequence
+positional_encode <- nn_module(
+  "positionalencoding",
+  
+  initialize = function(d_model, max_len=5000) {
+    self$d_model <- d_model
+    pe <- torch_zeros(max_len, d_model) # fill with zeros
+    position <- torch_arange(0, max_len - 1)$unsqueeze(2)
+    div_term <- torch_exp(torch_arange(0, d_model - 1, 2) * 
+                          -(log(10000.0) / d_model))
+    pe[, seq(1, d_model, 2)] <- torch_sin(position * div_term)
+    pe[, seq(2, d_model, 2)] <- torch_cos(position * div_term)
+
+    self$register_buffer("pe", pe$unsqueeze(1))
+  },
+  
+  forward = function(x) {
+    seq_len <- x$size(2)
+    x + self$pe[, 1:seq_len, ]
+  }
+)
+```
+Positional encoding will help model retain information about its input sequence.
+
+## Create Transformer model
+```{r}
+transformer_model <- nn_module(
+  "TransformerModel",
+  
+  initialize = function(input_dim=7, model_dim=64, num_heads=4, num_layers=2, 
+                  output_dim=24, dropout=0.1) {
+    
+    self$fc_in <- nn_linear(input_dim, model_dim)
+    self$fc_out <- nn_linear(model_dim, output_dim)
+    self$dropout <- nn_dropout(dropout)
+    
+    self$pos_encoder <- positional_encode(model_dim)
+    
+    # create encoder layer
+    encoder_layer <- nn_transformer_encoder_layer(
+      d_model = model_dim,
+      nhead = num_heads,
+      dim_feedforward = model_dim * 4,
+      dropout = dropout,
+      batch_first = TRUE)
+    
+    self$transformer_encoder <- nn_transformer_encoder(
+      encoder_layer,
+      num_layers = num_layers)
+  },
+  
+  forward = function (src) {
+    src <- self$fc_in(src)
+
+    src <- self$pos_encoder(src)
+    src <- self$dropout(src)
+    
+    out <- self$transformer_encoder(src)
+    out <- out[, -1, ]
+    self$fc_out(out)
+  }
+)
+```
+The transformers model is characterized by the initialization of position 
+encoding and fully connected layers, which is then implemented in the forward 
+function later on.
+
+## Initalize Model
+```{r}
+model <- transformer_model()
+optimizer <- optim_adam(model$parameters, lr=0.0001)
+loss_fn <- nn_mse_loss()
+
+epochs <- 20
+batch_size <- 32
+
+n_batches <- floor(X_train$size()[1] / batch_size)
+
+train_losses <- numeric(epochs)
+
+for (epoch in 1:epochs) {
+  total_loss <- 0
+  
+  for (i in 1:n_batches) {
+    start <- (i - 1) * batch_size + 1
+    end <- start + batch_size - 1
+    
+    x_batch <- X_train[start:end, ,]
+    y_batch <- y_train[start:end, ,]$squeeze(-1)
+    
+    optimizer$zero_grad()
+    output <- model(x_batch)
+    
+    loss <- loss_fn(output, y_batch)
+    loss$backward()
+    optimizer$step()
+    
+    total_loss <- total_loss + loss$item()
+  }
+  
+  epoch_loss <- total_loss / n_batches
+  train_losses[epoch] <- epoch_loss
+  cat(sprintf("Epoch %d, Training Loss: %3f\n", epoch, epoch_loss))
+}
+
+plot(1:epochs, train_losses, type="l", col="blue", lwd=2,
+     xlab="Epoch", ylab="Training Loss",
+     main="Torch Training Loss")
+```
+
+## Apply Model on Test Set
+```{r}
+evaluation <- function (X_test, y_test) {
+  model$eval() # set model to evaluation mode
+  
+  total_test_loss <- 0
+  n_batches_test <- floor(X_test$size()[1] / batch_size)
+  with_no_grad({
+    for (i in 1:n_batches_test) {
+        start <- (i - 1) * batch_size + 1
+        end <- start + batch_size - 1
+        
+        x_batch <- X_test[start:end, , ]
+        y_batch <- y_test[start:end, , ]$squeeze(-1)
+        
+        pred_batch <- model(x_batch)
+        loss <- loss_fn(pred_batch, y_batch)
+        total_test_loss <- total_test_loss + loss$item()
+      }
+      
+      avg_test_loss <- total_test_loss / n_batches_test
+      cat(sprintf("Testing Loss: %3f\n", avg_test_loss))
+    
+    
+    # model a sample prediction with one of the sequences
+    
+    sample_idx <- 1
+    sample_input <- X_test[sample_idx, , ]$unsqueeze(1)
+    prediction <- model(sample_input)
+    actual <- y_test[sample_idx, ]
+    
+    pred_values <- as.numeric(prediction$squeeze()$cpu())
+    actual_values <- as.numeric(actual$cpu())
+    
+    plot(1:pred_len, actual_values, type = "l", col = "black", lwd = 2,
+         xlab = "Hour", ylab = "OT (normalized)", 
+         main = "24-Hour Forecast: Actual vs Predicted",
+         ylim = range(c(pred_values, actual_values)))
+    lines(1:pred_len, pred_values, col = "red", lwd = 2, lty = 2)
+    legend("topright", legend = c("Actual", "Predicted"), 
+           col = c("black", "red"), lwd = 2, lty = c(1, 2)) })
+  }
+
+evaluation(X_test, y_test)
+```
+
+## Using Keras
+
+
+### Creating Sequence
+```{r}
+library(keras)
+library(abind)
+
+sequence_keras <- function(data, seq_len, pred_len) {
+  x_list <- list()
+  y_list <- list()
+  
+  for (i in 1:(nrow(data) - seq_len - pred_len + 1)) {
+    x_list[[i]] <- data[i:(i + seq_len - 1), ]
+    y_list[[i]] <- data[(i + seq_len):(i + seq_len + pred_len - 1), 7]
+  }
+  
+  x_array <- abind::abind(x_list, along=1) # combine 
+  dim(x_array) <- c(length(x_list), seq_len, ncol(data))
+  
+  y_array <- abind::abind(y_list, along=1)
+  dim(y_array) <- c(length(y_list), pred_len)
+  
+  return(list(x=x_array, y=y_array))
+}
+
+train_keras <- data[1:train_index, ]
+test_keras <- data[(train_index+1):nrow(data), ]
+
+train_seq_keras <- sequence_keras(train_keras, seq_len, pred_len)
+X_train_keras <- train_seq_keras$x
+y_train_keras <- train_seq_keras$y
+
+test_seq_keras  <- sequence_keras(test_keras, seq_len, pred_len)
+X_test_keras <- test_seq_keras$x
+y_test_keras <- test_seq_keras$y
+```
+
+### Positional Encoding
+
+```{r}
+positional_encoding_keras <- function(seq_len, d_model) {
+  seq_len <- as.integer(seq_len)
+  d_model <- as.integer(d_model)
+  
+  position <- matrix(rep(0:(seq_len-1), d_model), 
+                     nrow = seq_len, byrow = FALSE)
+  div_term <- exp(seq(0, d_model-1, by = 2) * -(log(10000) / d_model))
+  
+  pe <- matrix(0, nrow = seq_len, ncol = d_model)
+  pe[, seq(1, d_model, by = 2)] <- sin(position[, seq(1, d_model, by = 2)] 
+                                        * div_term)
+  pe[, seq(2, d_model, by = 2)] <- cos(position[, seq(2, d_model, by = 2)] 
+                                         * div_term)
+
+  array(pe, dim=c(1L, seq_len, d_model))
+  
+}
+
+add_positional_encoding <- function(x, seq_len, d_model) {
+  
+  pe <- positional_encoding_keras(seq_len, d_model)
+  pe_tensor <- k_constant(pe, dtype="float32")
+  x + pe_tensor
+}
+```
+
+### Build Transformer Model
+
+```{r}
+transformer_keras <- function(inputs , num_heads=4, ff_dim=256, dropout_rate=0.1) 
+  {
+  
+  attn_output <- layer_multi_head_attention(num_heads = num_heads, 
+                key_dim = inputs$shape[[3]])(inputs, inputs, inputs)
+  attn_output <- layer_dropout(attn_output, rate = dropout_rate)
+  
+  out1 <- layer_add(list(inputs, attn_output))
+  out1 <- layer_layer_normalization()(out1)
+  
+  # feed forward
+  ff1 <- layer_dense(units = ff_dim, activation = "relu")
+  ff2 <- layer_dense(units = as.integer(inputs$shape[[3]]))  # restore original dim
+  
+  ff_output <- ff1(out1)
+  ff_output <- ff2(ff_output)
+  ff_output <- layer_dropout(rate = dropout_rate)(ff_output)
+  
+  # Residual + normalization again
+  out_final <- layer_add(list(out1, ff_output))
+  out_final <- layer_layer_normalization()(out_final)
+  
+  return(out_final)
+  
+}
+```
+
+### Implement Model
+```{r}
+model_dim <- 64
+num_layers <- 2
+inputs <- layer_input(shape = c(seq_len, 7))
+x <- layer_dense(inputs, model_dim)
+
+x <- layer_lambda(
+  object = x,
+  f = function(t) add_positional_encoding(t, seq_len, model_dim),
+  output_shape = list(seq_len, model_dim) 
+)
+
+for (i in 1:num_layers) {
+  x <- transformer_keras(x)
+}
+
+x <- layer_global_average_pooling_1d(x)
+outputs <- layer_dense(x, pred_len)
+
+k_model <- keras_model(inputs, outputs)
+```
+
+### Train Model
+
+```{r}
+library(tensorflow)
+
+# compile
+k_model$compile(optimizer = optimizer_adam(learning_rate = 0.0001), loss="mse", 
+                metrics= list("mae"))
+
+
+# fit the model
+history <- k_model$fit(x = X_train_keras, y = y_train_keras, batch_size = 32L,
+      epochs = 20L, validation_data = list(X_test_keras, y_test_keras), 
+      verbose = 0)
+history$history$loss
+
+plot(history$history$loss, type = "l", lwd = 2,
+     xlab = "Epoch", ylab = "MSE",
+     main = "Keras Training Loss")
+```
+### Evaluate Model
+```{r}
+k_model$evaluate(x = X_test_keras, y = y_test_keras, verbose = 0)
+
+with_no_grad({
+    
+    sample_input <- X_test_keras[1, , , drop=FALSE]
+    pred <- k_model(sample_input)
+    actual <- y_test_keras[1, ]
+    
+    pred_values_keras <- as.numeric(pred)
+    actual_values_keras <- as.numeric(actual)
+    
+    plot(1:pred_len, actual_values_keras, type = "l", col = "black", lwd = 2,
+         xlab = "Hour", ylab = "OT (normalized)", 
+         main = "24-Hour Forecast: Actual vs Predicted",
+         ylim = range(c(pred_values_keras, actual_values_keras)))
+    lines(1:pred_len, pred_values_keras, col = "red", lwd = 2, lty = 2)
+    legend("topright", legend = c("Actual", "Predicted"), 
+           col = c("black", "red"), lwd = 2, lty = c(1, 2)) })
+
+```
+
+## Conclusion
+
+Using the Keras implementation resulted in slightly lower training losses 
+than torch, but torch reported a lower testing loss when the model was testing 
+on the validation set. This implies that while the Keras model may have learned 
+from the data better, it might be overfitting rather than actually generalizing 
+the patterns. Because torch has a lower testing loss, the torch model is 
+likely better for time-series forecasting of oil temperature using the 
+transformers architecture.
+
